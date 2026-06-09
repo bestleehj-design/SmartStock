@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3:*)",
+      "Bash(ls:*)",
+      "Bash(./venv/bin/python:*)",
+      "Bash(git -C /Users/alessa.tang/Develop/work/smark_stock/SmarkStock log --oneline -10)",
+      "Bash(pip3 install:*)"
+    ]
+  }
+}
