@@ -120,71 +120,192 @@ def load_all_stocks():
     return stocks
 
 
+# 直接读 DB，不再实例化 ThemeAnalyzer（避免重复加载 1172 个概念和 1557 天交易日历）
+_MACRO_INDEX_KW = [
+    '同花顺全A', '同花顺沪深', '同花顺主板', '同花顺大盘',
+    '同花顺陆股通', '同花顺深股通', '同花顺低估值',
+    '同花顺中证', '同花顺高估值', '同花顺小盘', '同花顺小市值',
+    '同花顺大市值', '同花顺低盈利', '同花顺热股',
+    '同花顺情绪指数', '同花顺',
+    '深市新主板', '沪市',
+    '融资融券', '深股通', '沪股通',
+    '昨日打板', '昨日涨停', '昨日首板', '昨日非ST',
+    '沪深主板昨日涨停', '龙虎榜指数', '近期新高',
+    '业绩预亏', '减持新规', '增发预案指数', '低市盈率',
+    '广东(除深圳)', '粤港澳大湾区', '京津冀一体化',
+    '长三角', '海南', '雄安',
+    '国企改革',
+]
+
+
+def _is_macro(name):
+    return any(kw in name for kw in _MACRO_INDEX_KW)
+
+
+def _get_trading_days(conn, lookback=21):
+    """获取最近 N 个交易日"""
+    c = conn.cursor()
+    c.execute(f"SELECT DISTINCT tradedate FROM daily_info_tbl ORDER BY tradedate DESC LIMIT {lookback}")
+    days = [row[0] for row in c.fetchall()]
+    c.close()
+    return sorted(days)
+
+
 def load_dynamic_themes(today=None):
-    """从 theme_analyzer 加载长期主线分析结果，生成动态板块
+    """从 theme_daily_score_tbl 读取长期主线分析结果，生成动态板块
 
+    不再实例化 ThemeAnalyzer，直接查 DB 已有结果，秒级返回。
     返回 (dynamic_sectors, dynamic_purity) 两个 dict。
-    失败或无新板块时静默返回空 dict，不影响现有功能。
     """
-    from theme.theme_analyzer import ThemeAnalyzer
-
     dynamic_sectors = {}
     dynamic_purity = {}
 
     try:
-        ta = ThemeAnalyzer()
-        if today is None:
-            today = datetime.date.today()
+        conn = get_db()
 
-        themes = ta.analyze_long_term_themes(
-            str(today), lookback_days=20, min_active_days=5,
-        )
+        # 1. 获取最近 21 个交易日
+        trading_days = _get_trading_days(conn, 21)
+        if len(trading_days) < 5:
+            return {}, {}
 
-        for theme in themes:
-            name = theme['theme_name']
-            avg_score = theme['avg_daily_score']
-            trend = theme['trend_label']
-            theme_code = theme['theme_code']
+        # 2. 批量查 theme_daily_score_tbl
+        placeholders = ','.join(['%s'] * len(trading_days))
+        c = conn.cursor()
+        c.execute(f"""
+            SELECT theme_code, theme_name, trade_date, total_score,
+                   zt_count, high_board_count, first_board_count
+            FROM theme_daily_score_tbl
+            WHERE trade_date IN ({placeholders})
+            ORDER BY theme_code, trade_date
+        """, trading_days)
+        rows = c.fetchall()
 
-            # 过滤条件
+        # 3. 组织数据: theme_code -> {date: record}
+        theme_daily = defaultdict(dict)
+        theme_names = {}
+        for row in rows:
+            tc, tn, td, ts, zc, hb, fb = row
+            if isinstance(td, (datetime.date, datetime.datetime)):
+                td = td.strftime('%Y-%m-%d') if hasattr(td, 'strftime') else str(td)
+            else:
+                td = str(td)
+            theme_names[tc] = tn
+            theme_daily[tc][td] = {
+                'total_score': float(ts) if ts else 0,
+                'zt_count': zc or 0,
+                'high_board_count': hb or 0,
+                'first_board_count': fb or 0,
+            }
+
+        # 4. 每日排名（用于 top5 频率）
+        daily_rankings = defaultdict(dict)
+        for td in trading_days:
+            td_str = td.strftime('%Y-%m-%d') if hasattr(td, 'strftime') else str(td)
+            scores = [(tc, theme_daily[tc][td_str]['total_score'])
+                      for tc in theme_daily if td_str in theme_daily[tc]]
+            scores.sort(key=lambda x: x[1], reverse=True)
+            for rank, (tc, _) in enumerate(scores, 1):
+                daily_rankings[td_str][tc] = rank
+
+        # 5. 计算长期得分
+        min_active = 5
+        long_themes = []
+        for tc, day_map in theme_daily.items():
+            name = theme_names[tc]
+            if _is_macro(name):
+                continue
+            if name in SECTOR_TO_KEYWORD:
+                continue
+
+            # 收集有数据的日子的评分
+            scores_list = []
+            for td in trading_days:
+                td_s = td.strftime('%Y-%m-%d') if hasattr(td, 'strftime') else str(td)
+                if td_s in day_map:
+                    scores_list.append(day_map[td_s]['total_score'])
+
+            active_days = len(scores_list)
+            if active_days < min_active:
+                continue
+
+            cumulative = sum(scores_list)
+            avg_score = cumulative / active_days
+
+            # 趋势：用最近有数据的 N 天做线性回归
+            trend_days = list(range(active_days))
+            if len(trend_days) >= 3:
+                n = len(trend_days)
+                sx = sum(trend_days)
+                sy = sum(scores_list)
+                sxy = sum(x * y for x, y in zip(trend_days, scores_list))
+                sxx = sum(x * x for x in trend_days)
+                denom = n * sxx - sx * sx
+                slope = (n * sxy - sx * sy) / denom if denom != 0 else 0
+                if slope > 0.3:
+                    trend = 'rising'
+                elif slope < -0.3:
+                    trend = 'declining'
+                else:
+                    trend = 'stable'
+            else:
+                trend = 'stable'
+
+            # 过滤
             if avg_score < 10:
                 continue
             if trend == 'declining':
                 continue
-            if ta._is_macro_index(name):
+
+            # top5 频率
+            top5_count = 0
+            for td in trading_days:
+                td_s = td.strftime('%Y-%m-%d') if hasattr(td, 'strftime') else str(td)
+                rank = daily_rankings.get(td_s, {}).get(tc, 999)
+                if rank <= 5:
+                    top5_count += 1
+
+            long_themes.append({
+                'theme_code': tc,
+                'theme_name': name,
+                'avg_daily_score': avg_score,
+                'trend_label': trend,
+                'top5_count': top5_count,
+            })
+
+        # 按 avg_score 排序
+        long_themes.sort(key=lambda x: x['avg_daily_score'], reverse=True)
+        c.close()
+
+        # 6. 生成 dynamic_sectors / dynamic_purity
+        for theme in long_themes:
+            name = theme['theme_name']
+            tc = theme['theme_code']
+            avg_score = theme['avg_daily_score']
+            trend = theme['trend_label']
+
+            # 查概念成分股
+            c2 = conn.cursor()
+            c2.execute("SELECT code, code_list FROM stock_basic_info_tbl WHERE type=2 AND code=%s", (tc,))
+            row = c2.fetchone()
+            c2.close()
+            if not row or not row[1]:
                 continue
+            # code_list 已带后缀（.SH/.SZ），直接用
+            stock_codes = [s.strip() for s in row[1].split(';') if s.strip()]
 
-            # 去重：跳过名字已存在于静态板块中的
-            if name in SECTOR_TO_KEYWORD:
-                continue
-
-            stock_codes = ta.ths_concept_to_stocks.get(theme_code, [])
-            if not stock_codes:
-                continue
-
-            # 查询成分股的 SW 分类
-            code_suffixes = []
-            for code in stock_codes:
-                suffix = '.SH' if code.startswith('6') else '.SZ'
-                code_suffixes.append(code + suffix)
-
-            conn = get_db()
-            c = conn.cursor()
-
+            # SW 分类统计
+            code_suffixes = stock_codes
             sw1_counter = defaultdict(int)
             sw2_counter = defaultdict(int)
             sw3_counter = defaultdict(int)
             total_stocks = 0
 
-            batch_size = 500
-            for i in range(0, len(code_suffixes), batch_size):
-                batch = code_suffixes[i:i + batch_size]
-                placeholders = ','.join(['%s'] * len(batch))
-                c.execute(f'''
-                    SELECT sw1, sw2, sw3 FROM stock_basic_info_tbl
-                    WHERE code IN ({placeholders}) AND type=0
-                ''', batch)
-                for sw1, sw2, sw3 in c.fetchall():
+            for i in range(0, len(code_suffixes), 500):
+                batch = code_suffixes[i:i + 500]
+                ph = ','.join(['%s'] * len(batch))
+                c3 = conn.cursor()
+                c3.execute(f'SELECT sw1, sw2, sw3 FROM stock_basic_info_tbl WHERE code IN ({ph}) AND type=0', batch)
+                for sw1, sw2, sw3 in c3.fetchall():
                     total_stocks += 1
                     if sw1:
                         sw1_counter[sw1] += 1
@@ -192,29 +313,22 @@ def load_dynamic_themes(today=None):
                         sw2_counter[sw2] += 1
                     if sw3:
                         sw3_counter[sw3] += 1
-
-            c.close()
-            conn.close()
+                c3.close()
 
             if total_stocks == 0:
                 continue
 
             threshold = max(1, total_stocks * 0.3)
-
-            # keywords: [板块名] + 最常见的2个sw2 + 最常见的2个sw3（≥30%成分股）
             keywords = [name]
-            top_sw2 = sorted(sw2_counter.items(), key=lambda x: x[1], reverse=True)[:2]
-            for sw, cnt in top_sw2:
+            for sw, cnt in sorted(sw2_counter.items(), key=lambda x: x[1], reverse=True)[:2]:
                 if cnt >= threshold:
                     keywords.append(sw)
-            top_sw3 = sorted(sw3_counter.items(), key=lambda x: x[1], reverse=True)[:2]
-            for sw, cnt in top_sw3:
+            for sw, cnt in sorted(sw3_counter.items(), key=lambda x: x[1], reverse=True)[:2]:
                 if cnt >= threshold:
                     keywords.append(sw)
 
-            # purity_rules: 最常见的2个sw1（≥30%成分股）
-            top_sw1 = sorted(sw1_counter.items(), key=lambda x: x[1], reverse=True)[:2]
-            purity = [sw for sw, cnt in top_sw1 if cnt >= threshold]
+            purity = [sw for sw, cnt in sorted(sw1_counter.items(), key=lambda x: x[1], reverse=True)[:2]
+                      if cnt >= threshold]
 
             dynamic_sectors[name] = keywords
             if purity:
@@ -223,10 +337,12 @@ def load_dynamic_themes(today=None):
             print(f"   🔥 {name}: score={avg_score:.1f}, trend={trend}, "
                   f"kw={keywords}, purity={purity}")
 
-        del ta
+        conn.close()
 
     except Exception as e:
         print(f"   ⚠️ 动态主线加载失败: {e}")
+        import traceback
+        traceback.print_exc()
         return {}, {}
 
     return dynamic_sectors, dynamic_purity
