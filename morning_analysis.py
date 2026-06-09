@@ -37,6 +37,14 @@ TRADING_PLAN = {
     '600584': {'name': '长电科技', 'cost': 78.46, 'shares': 500, 'max_shares': 600, 't_unit': 100},
 }
 
+# 卖出计划（含原始目标价，会被 SOX 乘数自动调节）
+SELL_PLANS = [
+    {'code': '06809', 'name': '澜起科技(HK)', 'action': '必清', 'orig_target': 360},
+    {'code': '00981', 'name': '中芯国际(HK)', 'action': '减仓可等', 'orig_target': 74},
+    {'code': '688981', 'name': '中芯国际(A)', 'action': '清仓', 'orig_target': 0},
+    {'code': '600584', 'name': '长电科技', 'action': '减30%', 'orig_target': 73},
+]
+
 # ============================================================
 # 配置
 # ============================================================
@@ -47,9 +55,9 @@ HOLDINGS = [
     {'code': '688981', 'name': '中芯国际', 'sector': '晶圆代工', 'market': 'A'},
     {'code': '603986', 'name': '兆易创新', 'sector': '存储芯片', 'market': 'A'},
     {'code': '002463', 'name': '沪电股份', 'sector': 'PCB', 'market': 'A'},
-    {'code': '603296', 'name': '华勤技术', 'sector': 'AI PC/消费电子ODM', 'market': 'A'},
-    {'code': '688008', 'name': '澜起科技', 'sector': '内存接口芯片/DDR5', 'market': 'A'},
+    {'code': '002138', 'name': '顺络电子', 'sector': '被动元件/电感', 'market': 'A'},
     {'code': '002384', 'name': '东山精密', 'sector': 'PCB/精密制造', 'market': 'A'},
+    {'code': '301591', 'name': '肯特股份', 'sector': '工程塑料', 'market': 'A'},
     # 港股
     {'code': '00981', 'name': '中芯国际(HK)', 'sector': '晶圆代工', 'market': 'HK'},
     {'code': '06809', 'name': '澜起科技(HK)', 'sector': '内存接口芯片/DDR5', 'market': 'HK'},
@@ -107,9 +115,47 @@ def analyze_sentiment(title, content=''):
 # 1. 隔夜美股
 # ============================================================
 
+def update_sox_db():
+    """从akshare拉最新SOX数据并更新MySQL（增量，不重复插入）"""
+    try:
+        df = ak.macro_global_sox_index()
+        if df is None or len(df) == 0:
+            return
+        conn = pymysql.connect(**DB_CONFIG)
+        cursor = conn.cursor()
+        latest = df.tail(5)  # 只更新最近5天
+        count = 0
+        for _, row in latest.iterrows():
+            try:
+                cursor.execute('''
+                    INSERT INTO sox_index_tbl (tradedate, close, chg_pct, chg_3m, chg_6m, chg_1y)
+                    VALUES (%s,%s,%s,%s,%s,%s)
+                    ON DUPLICATE KEY UPDATE close=VALUES(close), chg_pct=VALUES(chg_pct)
+                ''', (
+                    str(row['日期']), float(row['最新值']),
+                    float(row['涨跌幅']) if row['涨跌幅'] and row['涨跌幅'] != 'None' else None,
+                    float(row.get('近3月涨跌幅', 0) or 0) if row.get('近3月涨跌幅') else None,
+                    float(row.get('近6月涨跌幅', 0) or 0) if row.get('近6月涨跌幅') else None,
+                    float(row.get('近1年涨跌幅', 0) or 0) if row.get('近1年涨跌幅') else None,
+                ))
+                count += 1
+            except:
+                pass
+        conn.commit()
+        cursor.close()
+        conn.close()
+    except Exception:
+        pass  # 更新失败不影响主流程
+
+
 def fetch_us_market():
     """获取美股主要指数行情"""
     print(">>> 获取美股指数数据...")
+    # 先更新SOX数据库
+    try:
+        update_sox_db()
+    except:
+        pass
     indices = {
         '.DJI': '道琼斯工业',
         '.IXIC': '纳斯达克',
@@ -139,14 +185,17 @@ def fetch_us_market():
         except Exception as e:
             print(f"  {name}: 获取失败 - {e}")
 
-    # 费城半导体指数 SOX
+    # 费城半导体指数 SOX（从 MySQL 读取）
     try:
-        df = ak.macro_global_sox_index()
-        if df is not None and len(df) > 0:
-            latest = df.iloc[-1]
-            prev = df.iloc[-2] if len(df) > 1 else None
-            close_val = float(latest['最新值'])
-            prev_val = float(prev['最新值']) if prev is not None and prev['最新值'] else close_val
+        conn_sox = pymysql.connect(**DB_CONFIG)
+        cur_sox = conn_sox.cursor()
+        cur_sox.execute("SELECT close FROM sox_index_tbl ORDER BY tradedate DESC LIMIT 2")
+        rows_sox = cur_sox.fetchall()
+        cur_sox.close()
+        conn_sox.close()
+        if rows_sox and len(rows_sox) >= 2:
+            close_val = float(rows_sox[0][0])
+            prev_val = float(rows_sox[1][0])
             change = close_val - prev_val
             change_pct = (change / prev_val * 100) if prev_val else 0
             result['SOX'] = {
@@ -154,9 +203,11 @@ def fetch_us_market():
                 'close': close_val,
                 'change': round(float(change), 2),
                 'change_pct': round(float(change_pct), 2),
-                'date': str(latest['日期']),
+                'date': '',
             }
             print(f"  费城半导体: {result['SOX']['close']:.2f} ({result['SOX']['change_pct']:+.2f}%)")
+        else:
+            print(f"  费城半导体: MySQL 数据不完整")
     except Exception as e:
         print(f"  费城半导体: 获取失败 - {e}")
 
@@ -561,6 +612,40 @@ def extract_hot_keywords(titles, top_n=10):
     return [(w, c) for w, c in word_counter.most_common(top_n * 2) if c >= 2][:top_n]
 
 
+def adjust_targets_by_sox(sox_chg):
+    """根据 SOX 涨跌幅自动调整卖出目标价，返回调整后的列表"""
+    if sox_chg is None:
+        return []
+
+    if sox_chg >= 7:
+        multiplier = 1.02          # SOX+7% → 实际次日平均+2%
+        note = f'SOX{sox_chg:+.1f}% → 目标上调2%'
+    elif sox_chg >= 5:
+        multiplier = 1.015         # SOX+5% → 实际次日平均+1.5%
+        note = f'SOX{sox_chg:+.1f}% → 目标上调1.5%'
+    elif sox_chg >= 3:
+        multiplier = 1.01          # SOX+3% → 实际次日平均+1%
+        note = f'SOX{sox_chg:+.1f}% → 目标上调1%'
+    elif sox_chg <= -5:
+        multiplier = 0.99          # SOX-5% → 加速出货-1%
+        note = f'SOX{sox_chg:+.1f}% → 目标下调1%（加速出货）'
+    else:
+        return []
+
+    result = []
+    for plan in SELL_PLANS:
+        orig = plan['orig_target']
+        if orig == 0:
+            result.append({'name': plan['name'], 'action': plan['action'],
+                          'orig_target': '市价', 'adj_target': '市价'})
+            continue
+        adj = f'{orig * multiplier:.1f}'
+        result.append({'name': plan['name'], 'action': plan['action'],
+                      'orig_target': f'{orig:.0f}', 'adj_target': adj})
+
+    return result, note
+
+
 def print_report(us_data, hk_data, sector_data, news_data):
     """格式化输出盘前分析报告"""
     now = datetime.datetime.now()
@@ -597,6 +682,18 @@ def print_report(us_data, hk_data, sector_data, news_data):
             print(f"  💡 费城半导体涨{sox_chg:+.2f}%，利好半导体板块")
         elif sox_chg < -2:
             print(f"  ⚠️  费城半导体跌{sox_chg:+.2f}%，半导体板块承压")
+
+    # ---- SOX 目标价自动调整 ----
+    if us_data:
+        sox_chg_val = us_data.get('SOX', {}).get('change_pct', 0)
+        adj_result = adjust_targets_by_sox(sox_chg_val)
+        if adj_result:
+            adjusted, note = adj_result
+            print(f"\n  🎯 卖出目标自动调整 ({note})")
+            for item in adjusted:
+                arrow = '⬆' if '上调' in note else '⬇' if '下调' in note else '→'
+                print(f"    {arrow} {item['name']:14s} [{item['action']}]  "
+                      f"{item['orig_target']} → {item['adj_target']}")
 
     # ---- 港股 ----
     print(f"\n{'─'*70}")
