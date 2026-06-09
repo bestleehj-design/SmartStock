@@ -5,7 +5,7 @@
 **用法:** `/close`
 
 **执行逻辑:**
-1. 运行 `python3 close_analysis.py` 获取全量数据
+1. 运行 `python3 src/skills/close_analysis.py` 获取全量数据
 2. 大盘：三指数涨跌幅 + 量比 + 涨跌家数
 3. 结构判断：放量/缩量 × 上涨/下跌 → 四种组合
 4. 持仓：今日表现 + 量能 + MA位置 + 日内形态

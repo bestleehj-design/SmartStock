@@ -7,8 +7,8 @@
 **可选:** `/morning 2026-06-05` — 分析指定日期
 
 **执行逻辑:**
-1. 运行 `python3 recall_log.py` 回调昨日判断（加载上次的决策和逻辑）
-2. 运行 `python3 morning_analysis.py` 获取全量数据
+1. 运行 `python3 src/skills/recall_log.py` 回调昨日判断（加载上次的决策和逻辑）
+2. 运行 `python3 src/skills/morning_analysis.py` 获取全量数据
 3. 阅读 `trading_plan.md` 获取最新持仓和操作计划
 4. 总结关键结论：美股/港股方向、板块资金流向、持仓风险信号、综合判断
 5. 输出长电科技 T+0 操作计划（支撑/阻力/三种情景）

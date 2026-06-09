@@ -11,7 +11,7 @@
 
 **执行逻辑:**
 1. 如果用户给的是名称，先通过 `akshare.stock_info_a_code_name()` 查找代码
-2. 运行 `python3 stock_check.py <代码>` 获取完整数据
+2. 运行 `python3 src/skills/stock_check.py <代码>` 获取完整数据
 3. 结合数据给出技术面分析、止损/止盈建议
 
 **数据来源:** 东方财富 + 新浪财经 + 本地数据库
