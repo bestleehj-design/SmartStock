@@ -16,6 +16,7 @@ import os
 import datetime
 import time
 import traceback
+import re
 
 # Ensure src/ directory is in sys.path for package imports
 import sys, os
@@ -671,6 +672,8 @@ def print_report(us_data, hk_data, sector_data, news_data):
         print("  (暂无数据)")
 
     # 美股对A股影响判断
+    nasdaq_chg = 0
+    sox_chg = 0
     if us_data:
         nasdaq = us_data.get('.IXIC', {})
         sox = us_data.get('SOX', {})
@@ -835,14 +838,19 @@ def print_report(us_data, hk_data, sector_data, news_data):
         bear_signals += 1
 
     if bull_signals > bear_signals + 2:
+        judgment = '偏多'
         print(f"  🟢 偏多信号 (利好因素较多，关注科技股反弹机会)")
     elif bear_signals > bull_signals + 2:
+        judgment = '偏空'
         print(f"  🔴 偏空信号 (利空因素较多，注意风险控制)")
     elif bear_signals > bull_signals:
+        judgment = '偏谨慎'
         print(f"  🟡 偏谨慎 (略偏空，建议观望)")
     elif bull_signals > bear_signals:
+        judgment = '偏乐观'
         print(f"  🟡 偏乐观 (略偏多，可适当参与)")
     else:
+        judgment = '中性'
         print(f"  ⚪ 中性 (多空平衡，待方向明确)")
 
     print(f"  多头信号: {bull_signals}  空头信号: {bear_signals}")
@@ -853,6 +861,68 @@ def print_report(us_data, hk_data, sector_data, news_data):
     print(f"\n{'='*70}")
     print(f"  报告完毕: {now.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*70}\n")
+
+    return {
+        'sox_chg': sox_chg,
+        'nasdaq_chg': nasdaq_chg,
+        'bull_signals': bull_signals,
+        'bear_signals': bear_signals,
+        'judgment': judgment,
+        'hot_words': hot_words[:3],
+    }
+
+
+def update_trading_plan(summary_data):
+    """将盘前分析摘要写入 trading_plan.md"""
+    now = datetime.datetime.now()
+    today_str = now.strftime('%Y-%m-%d')
+
+    project_root = os.path.dirname(_SRC_DIR)
+    plan_path = os.path.join(project_root, 'trading_plan.md')
+
+    if not os.path.exists(plan_path):
+        print(">>> trading_plan.md 不存在，跳过更新")
+        return
+
+    with open(plan_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    # 1. Update title date
+    content = re.sub(r'# 交易计划 — \d{4}-\d{2}-\d{2}',
+                     f'# 交易计划 — {today_str}', content)
+
+    # 2. Build morning summary line
+    sox = summary_data['sox_chg']
+    nasdaq = summary_data['nasdaq_chg']
+    bull = summary_data['bull_signals']
+    bear = summary_data['bear_signals']
+    judgment = summary_data['judgment']
+    hot_words = summary_data['hot_words']
+
+    summary = f"- {today_str}盘前: SOX {sox:+.1f}%, 纳指 {nasdaq:+.1f}% | {judgment}(多{bull}空{bear})"
+    if hot_words:
+        words = ', '.join(w for w, _ in hot_words)
+        summary += f" | 热门: {words}"
+
+    # Skip if this morning's record already exists
+    if f'- {today_str}盘前:' in content:
+        print(f">>> {today_str} 盘前记录已存在，跳过更新")
+        return
+
+    # 3. Prepend to 盘前分析记录 section
+    pan_start = content.find('## 盘前分析记录')
+    if pan_start != -1:
+        after_heading = content[pan_start:]
+        first_dash = re.search(r'\n(- 20\d\d)', after_heading)
+        if first_dash:
+            dash_pos = pan_start + first_dash.start(1)
+            content = content[:dash_pos] + summary + '\n' + content[dash_pos:]
+
+    # 4. Write back
+    with open(plan_path, 'w', encoding='utf-8') as f:
+        f.write(content)
+
+    print(f">>> trading_plan.md 已更新盘前摘要 ({today_str})")
 
 
 # ============================================================
@@ -879,7 +949,11 @@ def main():
     news_data = fetch_stock_news()
 
     # 5. 打印报告
-    print_report(us_data, hk_data, sector_data, news_data)
+    summary_data = print_report(us_data, hk_data, sector_data, news_data)
+
+    # 6. 更新 trading_plan.md
+    print(">>> 更新 trading_plan.md 盘前摘要...")
+    update_trading_plan(summary_data)
 
 
 if __name__ == '__main__':

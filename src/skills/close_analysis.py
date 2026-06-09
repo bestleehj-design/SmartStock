@@ -3,7 +3,7 @@
 盘后综合分析 — 结合大盘、持仓、量价做明日预判
 用法: python3 close_analysis.py
 """
-import sys, os, datetime, requests, pymysql, subprocess
+import sys, os, re, datetime, requests, pymysql, subprocess
 
 # Ensure src/ directory is in sys.path for package imports
 import sys, os
@@ -335,6 +335,119 @@ def print_report(index_data, breadth, holdings, sox_chg):
     print(f"  报告完毕: {now.strftime('%H:%M:%S')}")
     print(f"{'='*65}\n")
 
+    return structure
+
+
+def update_trading_plan(holdings, index_data, breadth, sox_chg, structure):
+    """基于盘后分析结果自动更新 trading_plan.md"""
+    now = datetime.datetime.now()
+    today_str = now.strftime('%Y-%m-%d')
+    today_short = f"{now.month}/{now.day}"
+
+    project_root = os.path.dirname(_SRC_DIR)
+    plan_path = os.path.join(project_root, 'trading_plan.md')
+
+    if not os.path.exists(plan_path):
+        print(">>> trading_plan.md 不存在，跳过更新")
+        return
+
+    with open(plan_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    # 1. Update title date
+    content = re.sub(r'# 交易计划 — \d{4}-\d{2}-\d{2}',
+                     f'# 交易计划 — {today_str}', content)
+
+    # Skip if today's status section already exists
+    if f'## {today_short} 收盘状态' in content:
+        print(f">>> {today_short} 收盘状态 已存在，跳过更新")
+        return
+
+    # 2. Build 收盘状态 table
+    status_lines = [f'## {today_short} 收盘状态', '']
+    status_lines.append('| 代码 | 名称 | 收盘 | 涨跌 | MA20 | 量比 | 日内形态 | 自动判断 |')
+    status_lines.append('|------|------|------|------|------|------|---------|---------|')
+
+    for h in holdings:
+        code = h.get('code', '—')
+        name = h.get('name', '—')
+        price = h.get('price')
+        price_str = f"{price:.2f}" if isinstance(price, (int, float)) else '—'
+        chg_val = h.get('chg')
+        chg = f"{chg_val:+.1f}%" if chg_val is not None else '—'
+
+        above = h.get('above_ma20')
+        if above is True:
+            ma20 = '✅站'
+        elif above is False:
+            ma20 = '⚠️破'
+        else:
+            ma20 = '—'
+
+        vr = h.get('vol_ratio')
+        vol_str = f"{vr:.1f}x" if vr is not None and vr > 0 else '—'
+        intra = h.get('intraday', '—')
+
+        # Auto judgment
+        chg_num = chg_val if chg_val is not None else 0
+        if above is True and chg_num > 0:
+            judgment = '持有'
+        elif above is False and chg_num < -3:
+            judgment = '关注止损'
+        elif above is False:
+            judgment = '观察'
+        elif chg_num < -3:
+            judgment = '关注止损'
+        else:
+            judgment = '持有'
+
+        status_lines.append(
+            f'| {code} | {name} | {price_str} | {chg} | {ma20} | {vol_str} | {intra} | {judgment} |')
+
+    status_section = '\n'.join(status_lines)
+
+    # 3. Build 操作执行记录 template
+    record_lines = [f'## {today_short} 操作执行记录', '']
+    record_lines.append('| 标的 | 计划 | 实际 | 结果 |')
+    record_lines.append('|------|------|------|------|')
+
+    for h in holdings:
+        name = h.get('name', '—')
+        plan = h.get('plan', '—')
+        record_lines.append(f'| {name} | {plan} | 待填写 | 待填写 |')
+
+    record_section = '\n'.join(record_lines)
+
+    # 4. Insert both sections after 当前持仓 table (before next ## section)
+    match = re.search(r'(## 当前持仓.*?\n\n)(## )', content, re.DOTALL)
+    if match:
+        insert_at = match.start(2)
+        combined = status_section + '\n\n' + record_section + '\n\n'
+        content = content[:insert_at] + combined + content[insert_at:]
+    else:
+        print(">>> 无法定位「当前持仓」章节结尾，跳过更新")
+        return
+
+    # 5. Prepend analysis record to 盘前分析记录
+    up_count = sum(1 for h in holdings if (h.get('chg') or 0) > 0)
+    down_count = sum(1 for h in holdings if (h.get('chg') or 0) < 0)
+    sox_str = f"SOX {sox_chg:+.1f}%" if sox_chg else ''
+    summary = f"- {today_str}收盘: {structure} | {sox_str} | 持仓{up_count}涨{down_count}跌"
+
+    pan_start = content.find('## 盘前分析记录')
+    if pan_start != -1:
+        after_heading = content[pan_start:]
+        first_dash = re.search(r'\n(- 20\d\d)', after_heading)
+        if first_dash:
+            dash_pos = pan_start + first_dash.start(1)
+            content = content[:dash_pos] + summary + '\n' + content[dash_pos:]
+
+    # 6. Write back
+    with open(plan_path, 'w', encoding='utf-8') as f:
+        f.write(content)
+
+    print(f">>> trading_plan.md 已更新 ({today_str})")
+
 
 def main():
     print(">>> 更新个股日线数据...")
@@ -352,7 +465,10 @@ def main():
     print(">>> 获取SOX催化...")
     sox_chg = match_index_pattern(index_data)
 
-    print_report(index_data, breadth, holdings, sox_chg)
+    structure = print_report(index_data, breadth, holdings, sox_chg)
+
+    print(">>> 更新 trading_plan.md ...")
+    update_trading_plan(holdings, index_data, breadth, sox_chg, structure)
 
 
 if __name__ == '__main__':
