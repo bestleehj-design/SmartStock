@@ -173,7 +173,8 @@ def load_dynamic_themes(today=None):
         c = conn.cursor()
         c.execute(f"""
             SELECT theme_code, theme_name, trade_date, total_score,
-                   zt_count, high_board_count, first_board_count
+                   zt_count, high_board_count, first_board_count,
+                   score_index_rise
             FROM theme_daily_score_tbl
             WHERE trade_date IN ({placeholders})
             ORDER BY theme_code, trade_date
@@ -184,7 +185,7 @@ def load_dynamic_themes(today=None):
         theme_daily = defaultdict(dict)
         theme_names = {}
         for row in rows:
-            tc, tn, td, ts, zc, hb, fb = row
+            tc, tn, td, ts, zc, hb, fb, sir = row
             if isinstance(td, (datetime.date, datetime.datetime)):
                 td = td.strftime('%Y-%m-%d') if hasattr(td, 'strftime') else str(td)
             else:
@@ -195,6 +196,7 @@ def load_dynamic_themes(today=None):
                 'zt_count': zc or 0,
                 'high_board_count': hb or 0,
                 'first_board_count': fb or 0,
+                'score_index_rise': float(sir) if sir else 0,
             }
 
         # 4. 每日排名（用于 top5 频率）
@@ -343,9 +345,24 @@ def load_dynamic_themes(today=None):
         print(f"   ⚠️ 动态主线加载失败: {e}")
         import traceback
         traceback.print_exc()
-        return {}, {}
+        return {}, {}, {}
 
-    return dynamic_sectors, dynamic_purity
+    # 7. 构建板块强度索引（最新交易日的 score_index_rise）
+    latest_date = trading_days[-1]
+    latest_date_str = latest_date.strftime('%Y-%m-%d') if hasattr(latest_date, 'strftime') else str(latest_date)
+    theme_scores = {}
+    for tc, name in theme_names.items():
+        day_data = theme_daily.get(tc, {}).get(latest_date_str)
+        if day_data:
+            theme_scores[name] = day_data['score_index_rise']
+
+    return dynamic_sectors, dynamic_purity, theme_scores
+
+
+def _strip_sector_label(sector_name):
+    """去掉 ⭐ 和 (龙头)/（龙头）等装饰符"""
+    import re
+    return re.sub(r'^⭐|[*]|[（(]龙头[）)]', '', sector_name).strip()
 
 
 def assign_sector(stock_info, dynamic_sectors=None, dynamic_purity=None):
@@ -789,10 +806,10 @@ def screen(args):
                 print(f"   {label} {theme['name']} (强度{theme['boost']:.0%}): {kw_preview}...")
 
     # 0.5 加载动态主线
-    dynamic_sectors, dynamic_purity = {}, {}
+    dynamic_sectors, dynamic_purity, theme_scores_map = {}, {}, {}
     if not args.no_dynamic:
         print(f"\n🔍 动态主线分析...")
-        dynamic_sectors, dynamic_purity = load_dynamic_themes(
+        dynamic_sectors, dynamic_purity, theme_scores_map = load_dynamic_themes(
             datetime.date.today()
         )
         if dynamic_sectors:
@@ -865,6 +882,26 @@ def screen(args):
 
         main_sector = sectors[0] if sectors else '其他'
 
+        # 板块指数涨幅分（用于后续回溯验证板块动量）
+        # 选股器的板块简称 → DB 主题全称 映射（仅需覆盖 SECTOR_TO_KEYWORD 的 key）
+        _SECTOR_TO_SCORE_NAME = {
+            '光模块/CPO': '共封装光学(CPO)',
+            'PCB': 'PCB概念',
+            '电感/被动元件': '被动元件',
+            'AI服务器': '液冷服务器',
+            '半导体封测': '先进封装',
+            '晶圆代工': '中芯国际概念',
+        }
+        clean = _strip_sector_label(main_sector)
+        sector_rise = theme_scores_map.get(clean)
+        if sector_rise is None:
+            mapped = _SECTOR_TO_SCORE_NAME.get(clean)
+            if mapped:
+                sector_rise = theme_scores_map.get(mapped)
+        # 兜底：尝试加"概念"后缀
+        if sector_rise is None:
+            sector_rise = theme_scores_map.get(clean + '概念')
+
         results.append({
             'code': code,
             'name': stock_info['name'],
@@ -879,6 +916,7 @@ def screen(args):
             'warnings': warnings,
             'stop_loss': stop_info['stop_loss'],
             'risk_pct': stop_info['risk_pct'],
+            'sector_index_rise': sector_rise,
         })
 
     # 5. 排序
@@ -942,11 +980,12 @@ def save_to_db(results, screen_date):
             c.execute('''
                 INSERT INTO smart_screen_results
                 (screen_date, code, name, score, sector, is_leader,
-                 price, stop_loss, reasons, warnings)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 price, stop_loss, reasons, warnings, sector_index_rise)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON DUPLICATE KEY UPDATE
                 score=VALUES(score), price=VALUES(price),
                 is_leader=VALUES(is_leader),
+                sector_index_rise=VALUES(sector_index_rise),
                 reasons=VALUES(reasons), warnings=VALUES(warnings)
             ''', (
                 screen_date,
@@ -955,6 +994,7 @@ def save_to_db(results, screen_date):
                 r['price'], r['stop_loss'],
                 json.dumps(r['reasons'], ensure_ascii=False),
                 json.dumps(r['warnings'], ensure_ascii=False),
+                r.get('sector_index_rise'),
             ))
             saved += 1
         except Exception:
