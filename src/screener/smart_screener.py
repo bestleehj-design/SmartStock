@@ -1048,54 +1048,106 @@ def backfill_returns():
 
 
 def analyze_results():
-    """分析历史筛选效果，输出优化建议"""
+    """分析历史筛选效果，含板块动量维度"""
     conn = get_db()
     c = conn.cursor()
 
+    # 找到有收益数据的记录
+    c.execute("SELECT COUNT(*) FROM smart_screen_results WHERE ret_1d IS NOT NULL")
+    has_1d = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM smart_screen_results WHERE ret_5d IS NOT NULL")
+    has_5d = c.fetchone()[0]
+
+    ret_col = 'ret_1d' if has_1d > 0 and has_5d == 0 else ('ret_5d' if has_5d > 0 else None)
+    if ret_col is None:
+        print("\n  ⚠️ 尚无回填收益数据，请先执行 --backfill")
+        conn.close()
+        return
+
+    ret_label = {'ret_1d': '1日', 'ret_5d': '5日'}.get(ret_col, ret_col)
+
     print(f"\n{'='*70}")
-    print(f"  📊 回溯分析报告")
+    print(f"  📊 回溯分析报告（基于 {ret_label} 收益）")
     print(f"{'='*70}")
 
-    # 得分区间统计
-    c.execute("""
-        SELECT
-            CASE WHEN score>=70 THEN '70+'
-                 WHEN score>=50 THEN '50-69'
-                 ELSE '<50' END as tier,
-            COUNT(*) as cnt,
-            ROUND(AVG(ret_5d)*100,2) as avg_5d,
-            ROUND(AVG(ret_10d)*100,2) as avg_10d
-        FROM smart_screen_results WHERE ret_5d IS NOT NULL
+    # --- 1. 得分区间 ---
+    c.execute(f"""
+        SELECT CASE WHEN score>=70 THEN '70+'
+                     WHEN score>=50 THEN '50-69'
+                     ELSE '<50' END as tier,
+            COUNT(*), ROUND(AVG({ret_col})*100,2)
+        FROM smart_screen_results WHERE {ret_col} IS NOT NULL
         GROUP BY tier ORDER BY tier DESC
     """)
-    print(f"\n  📊 按得分区间：")
-    for r in c.fetchall():
-        print(f"    {r[0]}: {r[1]}只  avg5d={r[2]:+.2f}%  avg10d={r[3]:+.2f}%")
+    rows = c.fetchall()
+    if rows:
+        print(f"\n  📊 按得分区间（{ret_label}）：")
+        for r in rows:
+            print(f"    {r[0]:8s}: {r[1]}只  avg={r[2]:+.2f}%")
 
-    # 龙头 vs 非龙头
-    c.execute("""
-        SELECT is_leader,
-            COUNT(*) as cnt,
-            ROUND(AVG(ret_5d)*100,2) as avg_5d
-        FROM smart_screen_results WHERE ret_5d IS NOT NULL
+    # --- 2. 龙头 vs 非龙头 ---
+    c.execute(f"""
+        SELECT is_leader, COUNT(*), ROUND(AVG({ret_col})*100,2)
+        FROM smart_screen_results WHERE {ret_col} IS NOT NULL
         GROUP BY is_leader
     """)
-    print(f"\n  👑 龙头 vs 非龙头：")
-    for r in c.fetchall():
-        label = '龙头' if r[0] else '非龙头'
-        print(f"    {label}: {r[1]}只  avg5d={r[2]:+.2f}%")
+    rows = c.fetchall()
+    if rows:
+        print(f"\n  👑 龙头 vs 非龙头（{ret_label}）：")
+        for r in rows:
+            label = '⭐龙头' if r[0] else '非龙头'
+            print(f"    {label:8s}: {r[1]}只  avg={r[2]:+.2f}%")
 
-    # 板块统计
-    c.execute("""
-        SELECT sector, COUNT(*) as cnt,
-            ROUND(AVG(ret_5d)*100,2) as avg_5d
-        FROM smart_screen_results WHERE ret_5d IS NOT NULL
+    # --- 3. 板块收益 ---
+    c.execute(f"""
+        SELECT sector, COUNT(*) as cnt, ROUND(AVG({ret_col})*100,2) as avg_ret
+        FROM smart_screen_results WHERE {ret_col} IS NOT NULL
         GROUP BY sector HAVING cnt>=3
-        ORDER BY avg_5d DESC
+        ORDER BY avg_ret DESC LIMIT 10
     """)
-    print(f"\n  🏆 板块收益排名：")
-    for r in c.fetchall():
-        print(f"    {r[0]}: {r[1]}只  avg5d={r[2]:+.2f}%")
+    rows = c.fetchall()
+    if rows:
+        print(f"\n  🏆 板块收益 TOP10（{ret_label}）：")
+        for r in rows:
+            print(f"    {r[0]:25s}: {r[1]}只  avg={r[2]:+.2f}%")
+
+    # --- 4. 板块动量分析（sector_index_rise）---
+    c.execute(f"""
+        SELECT CASE WHEN sector_index_rise >= 8 THEN '强(8-10)'
+                     WHEN sector_index_rise >= 5 THEN '中(5-8)'
+                     WHEN sector_index_rise >= 2 THEN '弱(2-5)'
+                     WHEN sector_index_rise IS NOT NULL THEN '极弱(<2)'
+                     ELSE '无数据' END as tier,
+            COUNT(*), ROUND(AVG({ret_col})*100,2) as avg_ret
+        FROM smart_screen_results WHERE {ret_col} IS NOT NULL
+        GROUP BY tier ORDER BY tier
+    """)
+    rows = c.fetchall()
+    if rows and any(r[0] != '无数据' for r in rows):
+        print(f"\n  📈 板块强度 vs 个股收益（{ret_label}，攒数据中）：")
+        print(f"    {'板块强度':12s} {'数量':>5s} {'平均收益':>10s} {'结论':s}")
+        print(f"    {'-'*42}")
+        for r in rows:
+            conclusion = ''
+            if '强' in r[0] and r[2] and r[2] > 0:
+                conclusion = '← 强板块赚钱效应'
+            elif '极弱' in r[0] and r[2] and r[2] < 0:
+                conclusion = '← 弱板块拖累'
+            print(f"    {r[0]:12s} {r[1]:>5d}  {r[2]:>+10.2f}%  {conclusion}")
+
+    # --- 5. 最近一期详情 ---
+    c.execute("SELECT MAX(screen_date) FROM smart_screen_results WHERE ret_1d IS NOT NULL")
+    latest = c.fetchone()[0]
+    if latest:
+        c.execute(f"""
+            SELECT COUNT(*), ROUND(AVG(ret_1d)*100,2),
+                   COUNT(CASE WHEN ret_1d>0 THEN 1 END)
+            FROM smart_screen_results
+            WHERE screen_date=%s AND ret_1d IS NOT NULL
+        """, (latest,))
+        total, avg, win = c.fetchone()
+        print(f"\n  📅 {latest} 当日：")
+        print(f"    共 {total} 只, 平均 ret_1d={avg:+.2f}%, 胜率={win}/{total} ({win/total*100:.0f}%)")
 
     conn.close()
     print(f"\n{'='*70}\n")
