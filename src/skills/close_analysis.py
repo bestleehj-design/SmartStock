@@ -18,6 +18,12 @@ DB_CONFIG = {
     'database': 'gp2', 'charset': 'utf8mb4',
 }
 
+# 数据管道路径
+DATA_DIR = os.path.join(_SRC_DIR, 'data')
+
+# 持仓列表 (A股)
+A_HOLDINGS = ['600584.SH', '002463.SZ', '002138.SZ', '603986.SH', '002384.SZ', '000725.SZ']
+
 SINA_HEADERS = {'Referer': 'https://finance.sina.com.cn'}
 
 # 持仓列表
@@ -204,27 +210,46 @@ def match_index_pattern(index_data):
 
 
 def update_daily_db():
-    """盘后更新个股日线数据到本地库（daily_info_tbl 等）"""
-    try:
-        # 先尝试直接运行（不需要 sudo）
-        cmd = ['python3', 'new_get_all_stock.py', '--no-hk']
-        result = subprocess.run(cmd, cwd=SCRIPT_DIR,
-                                capture_output=True, text=True, timeout=600)
-        if result.returncode != 0:
-            # 直接运行失败，尝试 sudo（需用户在终端输入密码）
-            print(">>> 需要 sudo 权限，尝试 sudo 运行...")
-            result = subprocess.run(['sudo', '-S', 'python3', 'new_get_all_stock.py', '--no-hk'],
-                                    cwd=SCRIPT_DIR, timeout=600)
-        if result.returncode == 0:
-            print(">>> 个股日线数据更新完成")
-        else:
-            print(f">>> 数据更新退出码: {result.returncode}")
-            if hasattr(result, 'stderr') and result.stderr:
-                print(f"    {result.stderr.strip()[-300:]}")
-    except subprocess.TimeoutExpired:
-        print(">>> 数据更新超时(10分钟)，继续分析...")
-    except Exception as e:
-        print(f">>> 数据更新失败: {e}，继续分析...")
+    """盘后增量更新持仓A股日线 (新浪源, 快速).
+    全市场更新需运行 Tushare 管道: python3 src/data/new_get_all_stock.py --no-hk
+    """
+    import urllib.request
+    updated = 0
+    conn = pymysql.connect(**DB_CONFIG)
+    c = conn.cursor()
+    today_str = datetime.date.today().strftime('%Y-%m-%d')
+
+    for full_code in A_HOLDINGS:
+        try:
+            mkt = 'sh' if full_code.endswith('.SH') else 'sz'
+            code_num = full_code.replace('.SH', '').replace('.SZ', '')
+            url = f'https://hq.sinajs.cn/list={mkt}{code_num}'
+            req = urllib.request.Request(url, headers={'Referer': 'https://finance.sina.com.cn'})
+            data = urllib.request.urlopen(req, timeout=5).read().decode('gbk')
+            parts = data.split('"')[1].split(',')
+            if len(parts) < 6:
+                continue
+            cur = float(parts[3]); op = float(parts[1]); prev = float(parts[2])
+            hi = float(parts[4]); lo = float(parts[5]); vol = int(parts[8]) if len(parts) > 8 else 0
+
+            # 检查今天是否已有数据
+            c.execute('SELECT 1 FROM daily_info_tbl WHERE code=%s AND tradedate=%s', (full_code, today_str))
+            if c.fetchone():
+                continue
+
+            c.execute('''
+                INSERT INTO daily_info_tbl (code, tradedate, open, high, low, close, volume, adj_factor)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+            ''', (full_code, today_str, op, hi, lo, cur, vol, 1))
+            updated += 1
+        except Exception:
+            pass
+
+    conn.commit()
+    c.close()
+    conn.close()
+    if updated > 0:
+        print(f">>> A股持仓日线更新 {updated} 条")
 
 
 def print_report(index_data, breadth, holdings, sox_chg):

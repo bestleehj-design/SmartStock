@@ -64,6 +64,7 @@ HOLDINGS = [
     # 港股
     {'code': '00981', 'name': '中芯国际(HK)', 'sector': '晶圆代工', 'market': 'HK'},
     {'code': '06809', 'name': '澜起科技(HK)', 'sector': '内存接口芯片/DDR5', 'market': 'HK'},
+    {'code': '02476', 'name': '胜宏科技(HK)', 'sector': 'AI PCB/英伟达供应链', 'market': 'HK'},
 ]
 
 # 相关板块关键词
@@ -220,6 +221,64 @@ def fetch_us_market():
 # ============================================================
 # 2. 港股走势
 # ============================================================
+
+def update_hk_daily():
+    """增量拉取港股持仓的日K线数据入库 (使用新浪源, 境外可访问)."""
+    updated = 0
+    conn = pymysql.connect(**DB_CONFIG)
+    cursor = conn.cursor()
+
+    for h in HOLDINGS:
+        if h['market'] != 'HK':
+            continue
+        code = h['code']
+        full_code = code + '.HK'
+        try:
+            # 查数据库最近日期
+            cursor.execute(
+                'SELECT MAX(tradedate) FROM daily_info_tbl WHERE code=%s', (full_code,))
+            r = cursor.fetchone()
+            last_date = r[0] if r and r[0] else None
+
+            # 从 akshare 拉全量 (新浪源, 境外可用)
+            df = ak.stock_hk_daily(symbol=code, adjust='qfq')
+            if df is None or len(df) == 0:
+                continue
+
+            new_count = 0
+            for _, row in df.iterrows():
+                d = row['date']
+                if hasattr(d, 'strftime'):
+                    d = d.strftime('%Y-%m-%d')
+                if last_date and str(d) <= str(last_date):
+                    continue  # 已存在, 跳过
+                try:
+                    cursor.execute('''
+                        INSERT INTO daily_info_tbl (code, tradedate, open, high, low, close, volume, amount, adj_factor)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON DUPLICATE KEY UPDATE open=VALUES(open), high=VALUES(high),
+                                                low=VALUES(low), close=VALUES(close),
+                                                volume=VALUES(volume), amount=VALUES(amount)
+                    ''', (full_code, d, float(row['open']), float(row['high']),
+                          float(row['low']), float(row['close']),
+                          int(row['volume']), float(row['amount']), 1))
+                    new_count += 1
+                except Exception:
+                    pass
+
+            if new_count > 0:
+                print(f"  [{h['name']}] 港股日K更新 {new_count} 条")
+                updated += new_count
+        except Exception as e:
+            print(f"  [{h['name']}] 港股日K拉取失败: {e}")
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+    if updated > 0:
+        print(f"  港股日K共更新 {updated} 条")
+    return updated
+
 
 def fetch_hk_market():
     """获取港股主要指数"""
@@ -941,6 +1000,9 @@ def main():
 
     # 2. 港股走势
     hk_data = fetch_hk_market()
+
+    # 2.5 增量更新港股持仓日K线
+    update_hk_daily()
 
     # 3. 板块概念行情
     sector_data = fetch_sector_data()
