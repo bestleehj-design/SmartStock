@@ -459,6 +459,22 @@ class BounceScreener:
                     score += 5
                     reasons.append(f'缩量下跌 (量{vol_ratio:.1f}x) (+5)')
 
+        # ============================================================
+        # 因子5: 大单资金流 (5分) — 回测验证: 净买+3.55% vs 净卖+3.37%
+        # ============================================================
+        net_lg = getattr(self, '_screener_mf', {}).get(code)
+        if net_lg is not None:
+            # 占成交额比例
+            if net_lg > 0:
+                amt = today['close'] * today['volume']
+                lg_pct = abs(net_lg) / amt * 100 if amt > 0 else 0
+                if lg_pct > 1:
+                    score += 5
+                    reasons.append(f'大额净买入 ({lg_pct:.1f}%) (+5)')
+                else:
+                    score += 3
+                    reasons.append('大单净买入 (+3)')
+
         return score, reasons, warnings
 
     # ============================================================
@@ -509,43 +525,76 @@ class BounceScreener:
         idx = dates.index(date_str)
         return dates[idx-1] if idx > 0 else None
 
+    def _load_moneyflow(self, codes, dates):
+        """加载指定股票在指定日期的大单资金流。
+        返回: 存入 self._mf_data: {(full_code, date_str): net_lg_amount}
+        """
+        if not hasattr(self, '_mf_data'):
+            self._mf_data = {}
+        to_load = set()
+        for code in codes:
+            full = get_code_suffix(code)
+            for d in dates:
+                key = (full, d)
+                if key not in self._mf_data:
+                    to_load.add(key)
+
+        if not to_load:
+            return
+
+        c = self.conn.cursor()
+        date_set = sorted(set(d for _, d in to_load))
+        code_set = sorted(set(c for c, _ in to_load))
+        batch_size = 500
+
+        for i in range(0, len(code_set), batch_size):
+            batch_codes = code_set[i:i+batch_size]
+            placeholders_c = ','.join(['%s'] * len(batch_codes))
+            placeholders_d = ','.join(['%s'] * len(date_set))
+            c.execute(f'''
+                SELECT code, tradedate, net_lg_amount
+                FROM daily_moneyflow_tbl
+                WHERE code IN ({placeholders_c}) AND tradedate IN ({placeholders_d})
+            ''', batch_codes + date_set)
+            for row in c.fetchall():
+                full_code, d, amt = row
+                self._mf_data[(full_code, str(d))] = float(amt) if amt else 0
+        c.close()
+
     def run_backtest(self):
         """运行 4 因子回测验证"""
         print(f"\n{'=' * 70}")
-        print(f"  超跌反弹选股器 — 4 因子回测验证")
+        print(f"  超跌反弹选股器 — 因子回测验证")
         print(f"  时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
         print(f"{'=' * 70}")
 
-        crash_days = self._find_crash_days()
-        print(f'\n同步大跌日: {len(crash_days)} 天')
+        crash_days_list = self._find_crash_days()
+        crash_dates = [cd[0] for cd in crash_days_list]
+        print(f'\n同步大跌日: {len(crash_days_list)} 天: {", ".join(crash_dates)}')
 
-        if len(crash_days) < 5:
+        if len(crash_days_list) < 5:
             print('⚠️ 大跌日样本不足 (<5), 无法做统计')
             return
 
         # 加载全市场数据
-        np_today = None
-        d_today = None
-        try:
-            import numpy as np
-            np_today = np
-            d_today = date.today()
-        except:
-            pass
         codes = self._get_all_codes()
         print(f'加载 {len(codes)} 只股票日K数据...')
-
-        # 分步加载以节省内存: 批量加载
         self._load_daily(codes, days=120)
 
+        print(f'加载大单资金流数据...')
+        self._load_moneyflow(codes, crash_dates)
+
         # 收集数据
-        factor1 = defaultdict(list)  # 跌幅深度 → 次日收益
+        factor1 = defaultdict(list)  # 跌幅深度
         factor2 = defaultdict(list)  # MA60位置
         factor3 = defaultdict(list)  # 盘中承接
         factor4 = defaultdict(list)  # 板块主线
+        factor5 = defaultdict(list)  # 大单资金流
+        factor_cross = defaultdict(list)  # 交叉: 跌幅 × 资金流
+        mf_total, mf_missing = 0, 0
 
         processed = 0
-        for cd_date, sh_c, kc_c, cy_c in crash_days:
+        for cd_date, sh_c, kc_c, cy_c in crash_days_list:
             for code in codes:
                 daily = self._daily.get(code, [])
                 if not daily:
@@ -572,6 +621,46 @@ class BounceScreener:
                     continue
                 tomorrow = daily[crash_idx + 1]
                 next_ret = (tomorrow['close'] / today['close'] - 1) * 100
+
+                # --- 因子5: 大单资金流 ---
+                full_code = get_code_suffix(code)
+                net_lg = self._mf_data.get((full_code, cd_date))
+                if net_lg is not None:
+                    mf_total += 1
+                    if net_lg > 0:
+                        factor5['大单净买入'].append(next_ret)
+                    elif net_lg < 0:
+                        factor5['大单净卖出'].append(next_ret)
+                    else:
+                        factor5['大单持平'].append(next_ret)
+                    # 按资金流占成交额比例分档
+                    amt_today = today['close'] * today['volume']
+                    if amt_today > 0 and abs(net_lg) > 0:
+                        lg_pct = abs(net_lg) / amt_today * 100
+                        if lg_pct > 1:
+                            if net_lg > 0:
+                                factor5['大额净买入(>1%)'].append(next_ret)
+                            else:
+                                factor5['大额净卖出(>1%)'].append(next_ret)
+                else:
+                    mf_missing += 1
+
+                # --- 交叉: 跌幅深度 × 资金流 ---
+                if chg_today <= -8:
+                    depth_label = '崩盘'
+                elif chg_today <= -5:
+                    depth_label = '深跌'
+                elif chg_today <= -3:
+                    depth_label = '中跌'
+                elif chg_today <= -1:
+                    depth_label = '小跌'
+                else:
+                    depth_label = '抗跌'
+                if net_lg is not None:
+                    flow_label = '净买' if net_lg > 0 else ('净卖' if net_lg < 0 else '持平')
+                    factor_cross[f'{depth_label}+{flow_label}'].append(next_ret)
+                else:
+                    factor_cross[f'{depth_label}+无数据'].append(next_ret)
 
                 # --- 因子1: 跌幅深度 ---
                 if chg_today <= -8:
@@ -617,7 +706,7 @@ class BounceScreener:
 
                 processed += 1
 
-        print(f'分析 {processed} 条股票-大跌日记录\n')
+        print(f'分析 {processed} 条记录, 资金流覆盖 {mf_total} 条 (缺失 {mf_missing} 条)\n')
 
         # 打印各因子结果
         headers = ['分组', '均值', '中位数', '胜率', '标准差', '样本']
@@ -637,6 +726,28 @@ class BounceScreener:
             if rows:
                 _print_result_table(rows, headers)
             print()
+
+        # 因子5: 资金流
+        print(f'─── 因子5: 大单资金流 → 次日收益 ───')
+        rows5 = []
+        for key in ['大额净买入(>1%)', '大单净买入', '大单持平', '大单净卖出', '大额净卖出(>1%)']:
+            s = stats_summary(factor5.get(key, []))
+            if s['n'] >= 20:
+                rows5.append((key, s))
+        if rows5:
+            _print_result_table(rows5, headers)
+        print()
+
+        # 交叉分析: 跌幅 × 资金流
+        print(f'─── 交叉分析: 跌幅深度 × 资金流 → 次日收益 ───')
+        cross_rows = []
+        for key in sorted(factor_cross.keys()):
+            s = stats_summary(factor_cross[key])
+            if s['n'] >= 20:
+                cross_rows.append((key, s))
+        if cross_rows:
+            _print_result_table(cross_rows, headers)
+        print()
 
         # 检查项
         print('─── 验证结果 ───')
@@ -685,6 +796,28 @@ class BounceScreener:
                 '主线内 > 主线外 次日',
                 mainline_better,
                 f'主线={format_pct(f4_in["mean"])} vs 线外={format_pct(f4_out["mean"])}, n={f4_in["n"]}'
+            ))
+
+        # 因子5: 大单净买入 > 净卖出
+        f5_buy = stats_summary(factor5.get('大单净买入', []))
+        f5_sell = stats_summary(factor5.get('大单净卖出', []))
+        if f5_buy['n'] >= 30 and f5_sell['n'] >= 30:
+            flow_better = (f5_buy['mean'] or -99) > (f5_sell['mean'] or 99)
+            checks.append((
+                '大单净买入 > 大单净卖出',
+                flow_better,
+                f'净买={format_pct(f5_buy["mean"])} vs 净卖={format_pct(f5_sell["mean"])}, n={f5_buy["n"]}'
+            ))
+
+        # 因子5b: 深跌+净买 vs 深跌+净卖 (核心假设)
+        f5_deep_buy = stats_summary(factor_cross.get('深跌+净买', []))
+        f5_deep_sell = stats_summary(factor_cross.get('深跌+净卖', []))
+        if f5_deep_buy['n'] >= 30 and f5_deep_sell['n'] >= 30:
+            deep_flow = (f5_deep_buy['mean'] or -99) > (f5_deep_sell['mean'] or 99)
+            checks.append((
+                '深跌+净买 > 深跌+净卖 (核心假设)',
+                deep_flow,
+                f'净买={format_pct(f5_deep_buy["mean"])} vs 净卖={format_pct(f5_deep_sell["mean"])}, n={f5_deep_buy["n"]}'
             ))
 
         # 全市场次日均值
@@ -743,6 +876,18 @@ class BounceScreener:
         codes = self._get_all_codes()
         print(f'\n加载 {len(codes)} 只股票日K数据...')
         self._load_daily(codes, days=250)
+
+        # 加载今日大单资金流
+        today_str = date.today().strftime('%Y-%m-%d')
+        print(f'加载大单资金流...')
+        self._load_moneyflow(codes, [today_str])
+        # 存入 self._screener_mf 供 _score_stock 使用
+        self._screener_mf = {}
+        for code in codes:
+            full = get_code_suffix(code)
+            val = self._mf_data.get((full, today_str))
+            if val is not None:
+                self._screener_mf[code] = val
 
         # Step 3: 筛选评分
         print(f'评分中...')
