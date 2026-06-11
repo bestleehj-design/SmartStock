@@ -2,3 +2,4 @@ __pycache__/
 venv/
 logs/
 trading_plan.md
+src/data/config.py
