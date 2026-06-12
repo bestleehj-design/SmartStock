@@ -1,5 +1,6 @@
 __pycache__/
 venv/
 logs/
+exports/
 trading_plan.md
 src/data/config.py

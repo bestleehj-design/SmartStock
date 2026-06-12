@@ -21,21 +21,65 @@ DB_CONFIG = {
 # 数据管道路径
 DATA_DIR = os.path.join(_SRC_DIR, 'data')
 
-# 持仓列表 (A股)
-A_HOLDINGS = ['600584.SH', '002463.SZ', '002138.SZ', '603986.SH', '002384.SZ', '000725.SZ']
-
 SINA_HEADERS = {'Referer': 'https://finance.sina.com.cn'}
 
-# 持仓列表
-HOLDINGS = [
-    {'code': '600584.SH', 'name': '长电科技', 'plan': '已减30%，留350股等Q3'},
-    {'code': '002463.SZ', 'name': '沪电股份', 'plan': '不动'},
-    {'code': '002138.SZ', 'name': '顺络电子', 'plan': '不动，止盈56.70'},
-    {'code': '603986.SH', 'name': '兆易创新', 'plan': '不动，破MA20(451)减半'},
-    {'code': '002384.SZ', 'name': '东山精密', 'plan': '站回MA20就留'},
-    {'code': '301591.SZ', 'name': '肯特股份', 'plan': '不动不补'},
-    {'code': '688981.SH', 'name': '中芯国际A', 'plan': '趁反弹清仓'},
-]
+
+def _get_trading_plan_path():
+    """定位 trading_plan.md — 从技能脚本路径推导项目根目录"""
+    skill_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(os.path.dirname(skill_dir))
+    return os.path.join(project_root, 'trading_plan.md')
+
+
+def _load_holdings_from_md():
+    """从 trading_plan.md 读取当前活跃持仓。
+    返回 list of dict: [{'code': '600584.SH', 'name': '长电科技', 'plan': '...'}]
+    自动跳过已清仓(✅已清)和不活跃的持仓。
+    """
+    import re
+    holdings = []
+    plan_path = _get_trading_plan_path()
+    if not os.path.exists(plan_path):
+        return holdings
+
+    with open(plan_path, 'r') as f:
+        content = f.read()
+
+    # 提取 "当前持仓" 表格
+    m = re.search(r'## 当前持仓\s*\n\s*\n(.*?)(?=\n## |\n---|\Z)', content, re.DOTALL)
+    if not m:
+        return holdings
+    table_text = m.group(1)
+
+    # 解析表格行: | code | name | market | action | trigger |
+    for line in table_text.strip().split('\n'):
+        # 跳过表头/分隔行
+        if not line.strip().startswith('|') or '---' in line or '代码' in line:
+            continue
+        cols = [c.strip() for c in line.strip().split('|')[1:-1]]
+        if len(cols) < 4:
+            continue
+
+        code = cols[0]
+        name = cols[1]
+        action = cols[3]
+        trigger = cols[4] if len(cols) > 4 else ''
+
+        # 跳过已清仓
+        if '✅已清' in trigger or '✅已清' in action:
+            continue
+        # 跳过港股
+        if '.HK' in code or action == '港股':
+            continue
+        # 校验A股代码格式
+        if not re.match(r'\d{6}\.(SZ|SH)$', code):
+            continue
+
+        plan_text = f"{action} | {trigger}" if action and trigger else (action or trigger)
+        holdings.append({'code': code, 'name': name, 'plan': plan_text})
+
+    return holdings
+
 
 # 指数映射
 INDICES = [
@@ -127,19 +171,21 @@ def get_market_breadth():
 
 
 def get_holding_data():
-    """获取持仓今日表现"""
+    """获取持仓今日表现 (从 trading_plan.md 读取持仓列表)"""
     conn = pymysql.connect(**DB_CONFIG)
     cursor = conn.cursor()
 
-    # 从新浪实时获取今天数据
-    sina_map = {
-        '600584': 'sh600584', '688981': 'sh688981', '603986': 'sh603986',
-        '002463': 'sz002463', '002138': 'sz002138', '002384': 'sz002384',
-        '301591': 'sz301591',
-    }
+    holdings = _load_holdings_from_md()
+
+    # 自动生成 sina 代码映射
+    sina_map = {}
+    for h in holdings:
+        code_num = h['code'].replace('.SH', '').replace('.SZ', '')
+        mkt = 'sh' if h['code'].endswith('.SH') else 'sz'
+        sina_map[code_num] = f'{mkt}{code_num}'
 
     results = []
-    for h in HOLDINGS:
+    for h in holdings:
         code = h['code'].replace('.SH', '').replace('.SZ', '')
         sina_code = sina_map.get(code)
         info = {'name': h['name'], 'plan': h['plan'], 'code': code}
@@ -209,6 +255,29 @@ def match_index_pattern(index_data):
         return 0
 
 
+def _show_macro_events(today):
+    """根据当前日期判断宏观事件状态，避免显示已过去的事件"""
+    MACRO_CALENDAR = [
+        # (日期, 标题, 结果/描述)
+        ('2026-06-10', '美国5月CPI', '同比+4.2% 核心+2.9% 核心环比0.2%低于预期'),
+        ('2026-06-10', '美国5月PPI', '同比+6.5% 核心+3.1%'),
+        ('2026-06-12', 'SpaceX IPO', '定价$135 募资$750亿'),
+    ]
+    today_str = today.strftime('%Y-%m-%d')
+
+    # 找最近已发生的
+    recent = [(d, t, r) for d, t, r in MACRO_CALENDAR if d <= today_str]
+    # 找未来待发生的
+    upcoming = [(d, t, r) for d, t, r in MACRO_CALENDAR if d > today_str]
+
+    if recent:
+        for d, t, r in recent[-2:]:  # show last 2 recent events
+            print(f"  📊 {t} ({d}): {r}")
+    if upcoming:
+        next_event = upcoming[0]
+        print(f"  📅 下一个: {next_event[1]} ({next_event[0]})")
+
+
 def update_daily_db():
     """盘后增量更新持仓A股日线 (新浪源, 快速).
     全市场更新需运行 Tushare 管道: python3 src/data/new_get_all_stock.py --no-hk
@@ -219,7 +288,9 @@ def update_daily_db():
     c = conn.cursor()
     today_str = datetime.date.today().strftime('%Y-%m-%d')
 
-    for full_code in A_HOLDINGS:
+    holdings = _load_holdings_from_md()
+    for h in holdings:
+        full_code = h['code']
         try:
             mkt = 'sh' if full_code.endswith('.SH') else 'sz'
             code_num = full_code.replace('.SH', '').replace('.SZ', '')
@@ -320,7 +391,7 @@ def print_report(index_data, breadth, holdings, sox_chg):
 
     if sox_chg:
         print(f"\n  🌍 隔夜SOX: {sox_chg:+.2f}%")
-        print(f"  📅 今晚: CPI 数据发布")
+        _show_macro_events(now)
 
     # ---- 持仓 ----
     print(f"\n{'─'*65}")
@@ -350,11 +421,14 @@ def print_report(index_data, breadth, holdings, sox_chg):
     print(f"\n{'─'*65}")
     print(f"  🎯 明日关注")
     print(f"{'─'*65}")
-    print(f"  1. CPI 数据 (今晚)")
-    print(f"  2. 大盘是否放量确认 ({'上证>650亿' if avg_vr < 0.95 else '继续放量'})")
-    print(f"  3. 持仓最弱品种: 兆易创新 (关注是否破MA20)")
-    print(f"  4. 持仓最强品种: 顺络电子 (关注涨停后持续力度)")
-    print(f"  5. 待执行: 中芯国际A股清仓")
+    # 找最弱/最强持仓
+    valid = [h for h in holdings if h.get('chg') is not None]
+    if valid:
+        weakest = min(valid, key=lambda x: x.get('chg', 0))
+        strongest = max(valid, key=lambda x: x.get('chg', 0))
+        print(f"  2. 大盘是否放量确认 ({'上证>650亿' if avg_vr < 0.95 else '继续放量'})")
+        print(f"  3. 持仓最弱: {weakest['name']} ({weakest.get('chg', 0):+.1f}%, {'跌破MA20' if weakest.get('above_ma20') is False else '关注'})")
+        print(f"  4. 持仓最强: {strongest['name']} ({strongest.get('chg', 0):+.1f}%)")
 
     print(f"\n{'='*65}")
     print(f"  报告完毕: {now.strftime('%H:%M:%S')}")

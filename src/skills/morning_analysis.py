@@ -35,37 +35,128 @@ DB_CONFIG = {
     'database': 'gp2', 'charset': 'utf8mb4',
 }
 
-# T+0 交易计划配置
-TRADING_PLAN = {
-    '600584': {'name': '长电科技', 'cost': 78.46, 'shares': 500, 'max_shares': 600, 't_unit': 100},
+# ============================================================
+# 共享工具函数 — 从 trading_plan.md 加载配置
+# ============================================================
+
+def _get_trading_plan_path():
+    """定位 trading_plan.md"""
+    skill_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(os.path.dirname(os.path.dirname(skill_dir)), 'trading_plan.md')
+
+
+def _parse_md_table(content, section_name):
+    """通用工具: 从 markdown 内容中提取指定标题下的表格行.
+    返回 list of list (每行是去掉首尾 | 分隔的列).
+    """
+    m = re.search(r'## ' + re.escape(section_name) + r'[^\n]*\n\s*\n(.*?)(?=\n## |\n---|\Z)', content, re.DOTALL)
+    if not m:
+        return []
+    rows = []
+    for line in m.group(1).strip().split('\n'):
+        if not line.strip().startswith('|') or '---' in line or '代码' in line:
+            continue
+        cols = [c.strip() for c in line.strip().split('|')[1:-1]]
+        if cols:
+            rows.append(cols)
+    return rows
+
+
+# 持股的行业/概念映射 (静态元数据, 极少变动)
+SECTOR_MAP = {
+    '600584':  '半导体封测',
+    '688981':  '晶圆代工',
+    '603986':  '存储芯片',
+    '002463':  'PCB',
+    '002138':  '被动元件/电感',
+    '002384':  'PCB/精密制造',
+    '301591':  '工程塑料',
+    '00981':   '晶圆代工',
+    '06809':   '内存接口芯片/DDR5',
+    '02476':   'AI PCB/英伟达供应链',
 }
 
-# 卖出计划（含原始目标价，会被 SOX 乘数自动调节）
-SELL_PLANS = [
-    {'code': '06809', 'name': '澜起科技(HK)', 'action': '必清', 'orig_target': 360},
-    {'code': '00981', 'name': '中芯国际(HK)', 'action': '减仓可等', 'orig_target': 74},
-    {'code': '688981', 'name': '中芯国际(A)', 'action': '清仓', 'orig_target': 0},
-    {'code': '600584', 'name': '长电科技', 'action': '减30%', 'orig_target': 73},
-]
 
-# ============================================================
-# 配置
-# ============================================================
+def _load_holdings_from_md():
+    """从 trading_plan.md '当前持仓' 表格读取活跃持仓 (A股 + 港股).
+    自动跳过已清仓(✅已清).
+    """
+    plan_path = _get_trading_plan_path()
+    if not os.path.exists(plan_path):
+        return []
+    with open(plan_path, 'r', encoding='utf-8') as f:
+        content = f.read()
 
-HOLDINGS = [
-    # A股
-    {'code': '600584', 'name': '长电科技', 'sector': '半导体封测', 'market': 'A'},
-    {'code': '688981', 'name': '中芯国际', 'sector': '晶圆代工', 'market': 'A'},
-    {'code': '603986', 'name': '兆易创新', 'sector': '存储芯片', 'market': 'A'},
-    {'code': '002463', 'name': '沪电股份', 'sector': 'PCB', 'market': 'A'},
-    {'code': '002138', 'name': '顺络电子', 'sector': '被动元件/电感', 'market': 'A'},
-    {'code': '002384', 'name': '东山精密', 'sector': 'PCB/精密制造', 'market': 'A'},
-    {'code': '301591', 'name': '肯特股份', 'sector': '工程塑料', 'market': 'A'},
-    # 港股
-    {'code': '00981', 'name': '中芯国际(HK)', 'sector': '晶圆代工', 'market': 'HK'},
-    {'code': '06809', 'name': '澜起科技(HK)', 'sector': '内存接口芯片/DDR5', 'market': 'HK'},
-    {'code': '02476', 'name': '胜宏科技(HK)', 'sector': 'AI PCB/英伟达供应链', 'market': 'HK'},
-]
+    holdings = []
+    for cols in _parse_md_table(content, '当前持仓'):
+        if len(cols) < 4:
+            continue
+        raw_code, name, market_raw, action = cols[0], cols[1], cols[2], cols[3]
+        trigger = cols[4] if len(cols) > 4 else ''
+
+        if '✅已清' in trigger or '✅已清' in action:
+            continue
+
+        if market_raw == '港股' or '.HK' in raw_code:
+            code = raw_code.replace('.HK', '')
+            holdings.append({'code': code, 'name': name,
+                           'sector': SECTOR_MAP.get(code, '其他'), 'market': 'HK'})
+        elif re.match(r'\d{6}\.(SZ|SH)$', raw_code):
+            code = raw_code.replace('.SH', '').replace('.SZ', '')
+            holdings.append({'code': code, 'name': name,
+                           'sector': SECTOR_MAP.get(code, '其他'), 'market': 'A'})
+
+    return holdings
+
+
+def _load_trading_plan():
+    """从 trading_plan.md 'T+0 参数' 表格读取"""
+    plan_path = _get_trading_plan_path()
+    if not os.path.exists(plan_path):
+        return {}
+    with open(plan_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    result = {}
+    for cols in _parse_md_table(content, 'T+0 参数'):
+        if len(cols) < 5:
+            continue
+        try:
+            result[cols[0]] = {
+                'cost': float(cols[1]), 'shares': int(cols[2]),
+                'max_shares': int(cols[3]), 't_unit': int(cols[4]),
+            }
+        except (ValueError, IndexError):
+            continue
+    return result
+
+
+def _load_sell_plans():
+    """从 trading_plan.md '卖出目标' 表格读取"""
+    plan_path = _get_trading_plan_path()
+    if not os.path.exists(plan_path):
+        return []
+    with open(plan_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    result = []
+    for cols in _parse_md_table(content, '卖出目标'):
+        if len(cols) < 4:
+            continue
+        try:
+            result.append({
+                'code': cols[0], 'name': cols[1],
+                'action': cols[2],
+                'orig_target': float(cols[3]) if cols[3] != '0' else 0,
+            })
+        except (ValueError, IndexError):
+            continue
+    return result
+
+
+HOLDINGS = _load_holdings_from_md()
+TRADING_PLAN = _load_trading_plan()
+SELL_PLANS = _load_sell_plans()
 
 # 相关板块关键词
 RELATED_SECTORS = ['半导体', '芯片', 'PCB', '集成电路', '光通信', 'CPO', '先进封装',

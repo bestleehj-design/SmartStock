@@ -20,14 +20,43 @@ DB_CONFIG = {
     'database': 'gp2', 'charset': 'utf8mb4',
 }
 
-NAME_MAP = {
-    '600584': '长电科技', '688981': '中芯国际', '603986': '兆易创新',
-    '002463': '沪电股份', '002138': '顺络电子', '002384': '东山精密',
-    '301591': '肯特股份', '603296': '华勤技术', '688008': '澜起科技',
-    '00981': '中芯国际(HK)', '06809': '澜起科技(HK)',
-    '600522': '中天科技', '600703': '三安光电', '002273': '水晶光电',
-    '300162': '雷曼光电', '300296': '利亚德', '002456': '欧菲光',
+# 从 trading_plan.md 加载代码名称映射 (含已清仓, 含港股)
+def _load_name_map():
+    import re
+    skill_dir = os.path.dirname(os.path.abspath(__file__))
+    plan_path = os.path.join(os.path.dirname(os.path.dirname(skill_dir)), 'trading_plan.md')
+    if not os.path.exists(plan_path):
+        return {}
+    with open(plan_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    m = re.search(r'## 当前持仓\s*\n\s*\n(.*?)(?=\n## |\n---|\Z)', content, re.DOTALL)
+    if not m:
+        return {}
+
+    name_map = {}
+    for line in m.group(1).strip().split('\n'):
+        if not line.strip().startswith('|') or '---' in line or '代码' in line:
+            continue
+        cols = [c.strip() for c in line.strip().split('|')[1:-1]]
+        if len(cols) < 2:
+            continue
+        raw_code = cols[0]
+        name = cols[1]
+        # 去掉 .SH / .SZ / .HK 后缀，统一为 6 位数字代码
+        code = raw_code.replace('.SH', '').replace('.SZ', '').replace('.HK', '')
+        name_map[code] = name
+    return name_map
+
+
+NAME_MAP = _load_name_map()
+
+# 不在持仓表里的关注票 (手动补充)
+_NAME_MAP_EXTRA = {
+    '603296': '华勤技术',
+    '688008': '澜起科技',
 }
+NAME_MAP.update(_NAME_MAP_EXTRA)
 
 def log_one(code, action, thesis, stop, target, confidence, source, risk):
     conn = pymysql.connect(**DB_CONFIG)

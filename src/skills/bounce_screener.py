@@ -54,15 +54,32 @@ TRIGGER_THRESHOLDS = {
     '399006.SZ': -0.03,   # 创业板 ≥ 3%
 }
 
-# 白名单龙头 (反弹选股器用, 超跌后弹性好)
-BOUNCE_LEADERS = {
-    '002384', '600584', '002463', '002916', '300476',  # PCB/封测
-    '002156', '603005',  # 封测
-    '002138', '300408',  # 电感/被动元件
-    '603986', '688525',  # 存储
-    '300502', '300308',  # 光模块
-    '688981',           # 晶圆代工
-}
+# 白名单龙头 (从 trading_plan.md 读取)
+def _load_bounce_leaders():
+    """从 trading_plan.md '反弹选股池' 表格读取"""
+    import re
+    skill_dir = os.path.dirname(os.path.abspath(__file__))
+    plan_path = os.path.join(os.path.dirname(os.path.dirname(skill_dir)), 'trading_plan.md')
+    if not os.path.exists(plan_path):
+        return set()
+    with open(plan_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    m = re.search(r'## 反弹选股池[^\n]*\n\s*\n(.*?)(?=\n## |\n---|\Z)', content, re.DOTALL)
+    if not m:
+        return set()
+
+    leaders = set()
+    for line in m.group(1).strip().split('\n'):
+        if not line.strip().startswith('|') or '---' in line or '代码' in line:
+            continue
+        cols = [c.strip() for c in line.strip().split('|')[1:-1]]
+        if cols and re.match(r'\d{6}', cols[0]):
+            leaders.add(cols[0])
+    return leaders
+
+
+BOUNCE_LEADERS = _load_bounce_leaders()
 
 # 活跃主线关键词 (用于因子4板块效应)
 MAINLINE_KEYWORDS = [
